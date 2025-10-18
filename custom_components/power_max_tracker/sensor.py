@@ -1,254 +1,233 @@
-import logging
+# custom_components/power_max_tracker/sensor.py
+
+from __future__ import annotations
+
 from datetime import datetime
-from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, SensorStateClass
-from homeassistant.const import UnitOfPower
-from homeassistant.core import HomeAssistant
+from typing import Any, Optional
+
+from homeassistant.components.sensor import (
+    SensorEntity,
+    SensorDeviceClass,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_state_change_event, async_track_time_change
-from homeassistant.util import dt as dt_util
-from .const import DOMAIN, CONF_NUM_MAX_VALUES, CONF_SOURCE_SENSOR, CONF_BINARY_SENSOR
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import DOMAIN  # If you don't have const.py, you can inline DOMAIN = "power_max_tracker"
 from .coordinator import PowerMaxCoordinator
 
-_LOGGER = logging.getLogger(__name__)
 
-class GatedSensorEntity(SensorEntity):
-    """Base class for sensors gated by a binary sensor."""
+# Fallback in case const.py is not present
+try:
+    DOMAIN  # type: ignore  # noqa: F401
+except NameError:
+    DOMAIN = "power_max_tracker"
 
-    def __init__(self, entry: ConfigEntry):
-        """Initialize."""
-        super().__init__()
-        self._binary_sensor = entry.data.get(CONF_BINARY_SENSOR)
-
-    def _can_update(self):
-        """Check if the sensor can update based on binary sensor state."""
-        if not self._binary_sensor:
-            return True
-        state = self.hass.states.get(self._binary_sensor)
-        return state is not None and state.state == "on"
 
 async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-):
-    """Set up sensors."""
-    coordinator = hass.data[DOMAIN][entry.entry_id]
-    num_max_values = int(entry.data.get(CONF_NUM_MAX_VALUES, 2))  # Cast to int
-    sensors = [
-        MaxPowerSensor(coordinator, idx, f"Max Hourly Average Power {idx + 1}")
-        for idx in range(num_max_values)
-    ]
-    # Add average max power sensor
-    average_max_sensor = AverageMaxPowerSensor(coordinator, entry)
-    sensors.append(average_max_sensor)
-    # Add SourcePowerSensor
-    source_sensor = SourcePowerSensor(coordinator, entry)
-    sensors.append(source_sensor)
-    # Add HourlyAveragePowerSensor
-    hourly_average_power_sensor = HourlyAveragePowerSensor(coordinator, entry)
-    sensors.append(hourly_average_power_sensor)
-    async_add_entities(sensors, update_before_add=True)
-    for sensor in sensors:
-        coordinator.add_entity(sensor)
-        _LOGGER.debug(f"Registered sensor {sensor._attr_name} with coordinator, unique_id {sensor._attr_unique_id}, entity_id {sensor.entity_id}")
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+) -> None:
+    """Set up all sensors for a single config entry.
 
-class MaxPowerSensor(SensorEntity):
-    """Sensor for max hourly average power in kW."""
+    IMPORTANT:
+    - Entities are added EXACTLY ONCE here.
+    - The coordinator MUST NOT call async_add_entities().
+    """
+    data = hass.data.setdefault(DOMAIN, {}).get(entry.entry_id)
+    if not data or "coordinator" not in data:
+        # If __init__.py stored the coordinator differently, adjust the access here.
+        # Expected shape: hass.data[DOMAIN][entry.entry_id] = {"coordinator": PowerMaxCoordinator}
+        raise RuntimeError("Coordinator not found in hass.data")
 
-    def __init__(self, coordinator: PowerMaxCoordinator, index: int, name: str):
-        """Initialize."""
-        super().__init__()
-        self._coordinator = coordinator
+    coordinator: PowerMaxCoordinator = data["coordinator"]
+
+    entities: list[SensorEntity] = []
+
+    # Hourly average power (kW) for the ongoing hour
+    entities.append(HourlyAveragePowerSensor(coordinator, entry_id=entry.entry_id))
+
+    # Average of the max hourly averages (kW)
+    entities.append(AverageMaxHourlyAveragePowerSensor(coordinator, entry_id=entry.entry_id))
+
+    # Top-N max hourly average power sensors (kW)
+    for idx in range(1, coordinator.num_max_values + 1):
+        entities.append(MaxHourlyAveragePowerSensor(coordinator, index=idx, entry_id=entry.entry_id))
+
+    # Optional source instantaneous power (W)
+    entities.append(SourcePowerSensor(coordinator, entry_id=entry.entry_id))
+
+    # Register all entities ONCE
+    async_add_entities(entities, update_before_add=False)
+
+    # Mark as added so no other part of the integration attempts to add again
+    coordinator.mark_entities_added()
+
+
+# ---------------------------------------------------------------------------
+# Base class
+# ---------------------------------------------------------------------------
+
+
+class _PowerBaseSensor(CoordinatorEntity[PowerMaxCoordinator], SensorEntity):
+    """Base sensor binding the entity to the PowerMaxCoordinator.
+
+    - Provides common device_info and availability.
+    - Child classes set name, unique_id, device_class, state_class, unit, etc.
+    """
+
+    _attr_has_entity_name = True  # Let HA build friendly names from device + entity
+
+    def __init__(self, coordinator: PowerMaxCoordinator, entry_id: str) -> None:
+        super().__init__(coordinator)
+        self._entry_id = entry_id
+
+        # Device information groups all sensors under one device in HA UI
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry_id)},
+            "manufacturer": "Power Max Tracker",
+            "name": "Power Max Tracker",
+            "model": "Hourly/Max Average Power",
+        }
+
+    @property
+    def available(self) -> bool:
+        """Entity is available when the coordinator is running (best-effort)."""
+        # If you'd like stricter checks, base this on snapshot content.
+        return True
+
+    # Common helper to expose interval attributes for sensors that want them
+    def _interval_attrs(self) -> dict[str, Any]:
+        start: Optional[datetime] = self.coordinator.interval_start
+        end: Optional[datetime] = self.coordinator.interval_end
+
+        # ISO 8601 is a good default for attributes
+        start_iso = start.isoformat(timespec="minutes") if start else None
+        end_iso = end.isoformat(timespec="minutes") if end else None
+
+        label: Optional[str] = None
+        if start and end:
+            # Example: 2025-10-04 07:00–08:00
+            label = f"{start:%Y-%m-%d %H:%M}–{end:%H:%M}"
+
+        return {
+            "interval_start": start_iso,
+            "interval_end": end_iso,
+            "interval_label": label,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Concrete sensor entities
+# ---------------------------------------------------------------------------
+
+
+class HourlyAveragePowerSensor(_PowerBaseSensor):
+    """Current hour's average power in kW."""
+
+    _attr_name = "Hourly Average Power"
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "kW"
+
+    def __init__(self, coordinator: PowerMaxCoordinator, entry_id: str) -> None:
+        super().__init__(coordinator, entry_id)
+        self._attr_unique_id = f"{entry_id}_hourly_average_power"
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the average power (kW) for the ongoing hour."""
+        val = self.coordinator.hourly_average_kw
+        if val is None:
+            return None
+        # Round sensibly for UI; keep more precision if your data justifies it
+        return round(float(val), 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose interval attributes to aid automations and dashboards."""
+        return self._interval_attrs()
+
+
+class AverageMaxHourlyAveragePowerSensor(_PowerBaseSensor):
+    """Average of the top-N max hourly average power values (kW)."""
+
+    _attr_name = "Average Max Hourly Average Power"
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "kW"
+
+    def __init__(self, coordinator: PowerMaxCoordinator, entry_id: str) -> None:
+        super().__init__(coordinator, entry_id)
+        self._attr_unique_id = f"{entry_id}_avg_max_hourly_average_power"
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the average of the coordinator's max values list."""
+        return self.coordinator.compute_average_of_max()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose the underlying list to make reasoning in HA templates easier."""
+        attrs = self._interval_attrs()
+        # Provide the raw max list for transparency/debugging
+        attrs["max_values_kw"] = list(self.coordinator.max_values_kw)
+        return attrs
+
+
+class MaxHourlyAveragePowerSensor(_PowerBaseSensor):
+    """The Nth max hourly average power value (kW), where index starts at 1."""
+
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "kW"
+
+    def __init__(self, coordinator: PowerMaxCoordinator, index: int, entry_id: str) -> None:
+        super().__init__(coordinator, entry_id)
+        if index < 1:
+            raise ValueError("index must start at 1")
         self._index = index
-        self._attr_name = name
-        self._attr_unique_id = f"{coordinator.entry.entry_id}_max_values_{index + 1}"
-        self._attr_device_class = SensorDeviceClass.POWER
-        self._attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:chart-line"
-        self._attr_should_poll = False  # Updated via coordinator
-        self._attr_force_update = True  # Force state updates
+        self._attr_name = f"Max Hourly Average Power #{index}"
+        self._attr_unique_id = f"{entry_id}_max_hourly_average_power_{index}"
 
     @property
-    def native_value(self):
-        """Return the state."""
-        max_values = self._coordinator.max_values
-        return round(max_values[self._index], 2) if len(max_values) > self._index else 0.0
-
-class AverageMaxPowerSensor(SensorEntity):
-    """Sensor for the average of all max hourly average power values."""
-
-    def __init__(self, coordinator: PowerMaxCoordinator, entry: ConfigEntry):
-        """Initialize."""
-        super().__init__()
-        self._coordinator = coordinator
-        self._entry = entry
-        self._attr_name = "Average Max Hourly Average Power"
-        self._attr_unique_id = f"{entry.entry_id}_average_max"
-        self._attr_device_class = SensorDeviceClass.POWER
-        self._attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:chart-line"
-        self._attr_should_poll = False  # Updated via coordinator
-        self._attr_force_update = True  # Force state updates
+    def native_value(self) -> float | None:
+        """Return the Nth element from the sorted max list if present."""
+        values = self.coordinator.max_values_kw  # expected sorted desc
+        if not values or self._index > len(values):
+            return None
+        return round(float(values[self._index - 1]), 2)
 
     @property
-    def native_value(self):
-        """Return the state."""
-        max_values = self._coordinator.max_values
-        if max_values:
-            return round(sum(max_values) / len(max_values), 2)
-        return 0.0
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose interval attributes and index for clarity."""
+        attrs = self._interval_attrs()
+        attrs["index"] = self._index
+        return attrs
 
-class SourcePowerSensor(GatedSensorEntity):
-    """Sensor that tracks the source sensor state, gated by binary sensor."""
 
-    def __init__(self, coordinator: PowerMaxCoordinator, entry: ConfigEntry):
-        """Initialize."""
-        super().__init__(entry)
-        self._coordinator = coordinator
-        self._entry = entry
-        self._source_sensor = entry.data[CONF_SOURCE_SENSOR]
-        self._attr_name = f"Power Max Source {self._source_sensor.split('.')[-1]}"
-        self._attr_unique_id = f"{entry.entry_id}_source"
-        self._attr_device_class = SensorDeviceClass.POWER
-        self._attr_native_unit_of_measurement = UnitOfPower.WATT
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:power"
-        self._attr_should_poll = False  # Updated via state changes
-        self._state = 0.0
+class SourcePowerSensor(_PowerBaseSensor):
+    """Instantaneous source power in W (optional mirror of a live sensor)."""
 
-    async def async_added_to_hass(self):
-        """Handle entity added to hass."""
-        async def _async_state_changed(event):
-            """Handle state changes of source or binary sensor."""
-            if self._can_update():
-                source_state = self.hass.states.get(self._source_sensor)
-                if source_state is not None and source_state.state not in ("unavailable", "unknown"):
-                    try:
-                        value = float(source_state.state)
-                        self._state = max(0.0, value)  # Ignore negative values
-                    except (ValueError, TypeError):
-                        _LOGGER.warning(f"Invalid state for {self._source_sensor}: {source_state.state}")
-                        self._state = 0.0
-                else:
-                    _LOGGER.debug(f"Source sensor {self._source_sensor} unavailable or unknown")
-                    self._state = 0.0
-            else:
-                self._state = 0.0
-            self.async_write_ha_state()
+    _attr_name = "Source Power"
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "W"
 
-        # Track state changes of source and binary sensors
-        sensors = [self._source_sensor]
-        if self._binary_sensor:
-            sensors.append(self._binary_sensor)
-        self.async_on_remove(
-            async_track_state_change_event(
-                self.hass, sensors, _async_state_changed
-            )
-        )
+    def __init__(self, coordinator: PowerMaxCoordinator, entry_id: str) -> None:
+        super().__init__(coordinator, entry_id)
+        self._attr_unique_id = f"{entry_id}_power_max_source"
 
     @property
-    def native_value(self):
-        """Return the state."""
-        return self._state
-
-
-class HourlyAveragePowerSensor(GatedSensorEntity):
-    """Sensor for hourly average power in kW so far the current hour."""
-
-    def __init__(self, coordinator: PowerMaxCoordinator, entry: ConfigEntry):
-        """Initialize."""
-        super().__init__(entry)
-        self._coordinator = coordinator
-        self._entry = entry
-        self._source_sensor = entry.data[CONF_SOURCE_SENSOR]
-        self._attr_name = f"Hourly Average Power {self._source_sensor.split('.')[-1]}"
-        self._attr_unique_id = f"{entry.entry_id}_hourly_average_power"
-        self._attr_device_class = SensorDeviceClass.POWER
-        self._attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:lightning-bolt"
-        self._attr_should_poll = False
-        self._accumulated_energy = 0.0
-        self._last_power = 0.0
-        self._last_time = None
-        self._hour_start = None
-
-    async def async_added_to_hass(self):
-        """Handle entity added to hass."""
-        async def _async_hour_start(now):
-            """Reset at the start of each hour."""
-            self._accumulated_energy = 0.0
-            self._last_power = 0.0
-            self._last_time = now
-            self._hour_start = now
-            self.async_write_ha_state()
-
-        # Track hour changes
-        self.async_on_remove(
-            async_track_time_change(
-                self.hass,
-                _async_hour_start,
-                hour=None,
-                minute=0,
-                second=0,
-            )
-        )
-
-        # Initialize
-        await _async_hour_start(dt_util.utcnow())
-
-        async def _async_state_changed(event):
-            """Handle state changes of source or binary sensor."""
-            now = dt_util.utcnow()
-            if self._last_time is None:
-                self._last_time = now
-                return
-            if self._can_update():
-                source_state = self.hass.states.get(self._source_sensor)
-                if source_state is not None and source_state.state not in ("unavailable", "unknown"):
-                    try:
-                        current_power = float(source_state.state)
-                        if current_power < 0:
-                            current_power = 0.0
-                        delta_seconds = (now - self._last_time).total_seconds()
-                        if delta_seconds > 0:
-                            # Average power in W
-                            avg_power = (self._last_power + current_power) / 2
-                            # Energy in kWh
-                            delta_energy = avg_power * delta_seconds / 3600000
-                            self._accumulated_energy += delta_energy
-                        self._last_power = current_power
-                        self._last_time = now
-                    except (ValueError, TypeError):
-                        _LOGGER.warning(f"Invalid state for {self._source_sensor}: {source_state.state}")
-                        self._last_power = 0.0
-                else:
-                    _LOGGER.debug(f"Source sensor {self._source_sensor} unavailable or unknown")
-                    self._last_power = 0.0
-            else:
-                self._last_power = 0.0
-            self.async_write_ha_state()
-
-        # Track state changes of source and binary sensors
-        sensors = [self._source_sensor]
-        if self._binary_sensor:
-            sensors.append(self._binary_sensor)
-        self.async_on_remove(
-            async_track_state_change_event(
-                self.hass, sensors, _async_state_changed
-            )
-        )
+    def native_value(self) -> float | None:
+        """Return instantaneous source power in W, if provided by the coordinator."""
+        val = self.coordinator.source_power_w
+        if val is None:
+            return None
+        return round(float(val), 0)
 
     @property
-    def native_value(self):
-        """Return the state."""
-        if self._hour_start is None:
-            return 0.0
-        now = dt_util.utcnow()
-        elapsed_hours = (now - self._hour_start).total_seconds() / 3600
-        if elapsed_hours > 0:
-            return round(self._accumulated_energy / elapsed_hours, 3)
-        return 0.0
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose interval attributes to align with other sensors."""
+        return self._interval_attrs()
