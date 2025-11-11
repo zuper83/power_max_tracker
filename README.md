@@ -5,7 +5,7 @@
 The **Power Max Tracker** integration for Home Assistant tracks the maximum hourly average power values from a specified power sensor, with optional gating by a binary sensor. It creates sensors to display the top power values in kilowatts (kW), their average, a source sensor that mirrors the input sensor in watts (W), and an hourly average power sensor, all ignoring negative values and setting to `0` when the binary sensor is off.
 
 ## Features
-- **Max Power Sensors**: Creates `num_max_values` sensors (e.g., `sensor.max_hourly_average_power_1_<entry_id>`, `sensor.max_hourly_average_power_2_<entry_id>`) showing the top hourly average power values in kW, rounded to 2 decimal places.
+- **Max Power Sensors**: Creates `num_max_values` sensors (e.g., `sensor.max_hourly_average_power_1_<entry_id>`, `sensor.max_hourly_average_power_2_<entry_id>`) showing the top hourly average power values in kW, rounded to 2 decimal places, with a `last_update` attribute for the timestamp of the last value change.
 - **Average Max Power Sensor**: Creates a sensor (e.g., `sensor.average_max_hourly_average_power_<entry_id>`) showing the average of all max hourly average power values in kW, with an attribute `previous_month_average` for the previous month's average.
 - **Source Power Sensor**: Creates a sensor (e.g., `sensor.power_max_source_<entry_id>`) that tracks the source sensor's state in watts, setting to `0` for negative values or when the binary sensor is off/unavailable.
 - **Hourly Average Power Sensor**: Creates a sensor (e.g., `sensor.hourly_average_power_<entry_id>`) that calculates the average power in kW so far in the current hour based on the source sensor's power, gated by the binary sensor, with periodic updates to account for 0W periods.

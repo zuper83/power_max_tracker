@@ -69,12 +69,27 @@ class MaxPowerSensor(SensorEntity):
         self._attr_icon = "mdi:chart-line"
         self._attr_should_poll = False  # Updated via coordinator
         self._attr_force_update = True  # Force state updates
+        self._last_value = None
+        self._last_update = None
 
     @property
     def native_value(self):
         """Return the state."""
         max_values = self._coordinator.max_values
-        return round(max_values[self._index], 2) if len(max_values) > self._index else 0.0
+        current_value = (
+            round(max_values[self._index], 2) if len(max_values) > self._index else 0.0
+        )
+        if current_value != self._last_value:
+            self._last_value = current_value
+            self._last_update = datetime.now()
+        return current_value
+
+    @property
+    def extra_state_attributes(self):
+        """Return extra attributes."""
+        return {
+            "last_update": self._last_update.isoformat() if self._last_update else None
+        }
 
 class AverageMaxPowerSensor(SensorEntity):
     """Sensor for the average of all max hourly average power values."""
