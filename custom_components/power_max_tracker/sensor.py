@@ -7,6 +7,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event, async_track_time_change
 from homeassistant.util import dt as dt_util
+from homeassistant.helpers.storage import async_get_store
 from .const import DOMAIN, CONF_NUM_MAX_VALUES, CONF_SOURCE_SENSOR, CONF_BINARY_SENSOR
 from .coordinator import PowerMaxCoordinator
 
@@ -195,19 +196,51 @@ class HourlyAveragePowerSensor(GatedSensorEntity):
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:lightning-bolt"
         self._attr_should_poll = False
+        # Initialize state (will be loaded in async_added_to_hass)
         self._accumulated_energy = 0.0
         self._last_power = 0.0
         self._last_time = None
         self._hour_start = None
+        self._store = None
+
+    async def _save_state(self):
+        """Save the current state to storage."""
+        if self._store:
+            data = {
+                "accumulated_energy": self._accumulated_energy,
+                "last_power": self._last_power,
+                "last_time": self._last_time.isoformat() if self._last_time else None,
+                "hour_start": self._hour_start.isoformat()
+                if self._hour_start
+                else None,
+            }
+            await self._store.async_save(data)
 
     async def async_added_to_hass(self):
         """Handle entity added to hass."""
+        # Get storage for this sensor
+        self._store = async_get_store(
+            self.hass, "power_max_tracker", f"{self._entry.entry_id}_hourly_sensor"
+        )
+        # Load persisted state
+        stored_data = await self._store.async_load()
+        if stored_data:
+            self._accumulated_energy = stored_data.get("accumulated_energy", 0.0)
+            self._last_power = stored_data.get("last_power", 0.0)
+            last_time_str = stored_data.get("last_time")
+            if last_time_str:
+                self._last_time = dt_util.parse_datetime(last_time_str)
+            hour_start_str = stored_data.get("hour_start")
+            if hour_start_str:
+                self._hour_start = dt_util.parse_datetime(hour_start_str)
+
         async def _async_hour_start(now):
             """Reset at the start of each hour."""
             self._accumulated_energy = 0.0
             self._last_power = 0.0
             self._last_time = now
             self._hour_start = now
+            await self._save_state()
             self.async_write_ha_state()
 
         # Track hour changes
