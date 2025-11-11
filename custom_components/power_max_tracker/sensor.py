@@ -224,6 +224,8 @@ class HourlyAveragePowerSensor(GatedSensorEntity):
         )
         # Load persisted state
         stored_data = await self._store.async_load()
+        now = dt_util.utcnow()
+        current_hour_start = now.replace(minute=0, second=0, microsecond=0)
         if stored_data:
             self._accumulated_energy = stored_data.get("accumulated_energy", 0.0)
             self._last_power = stored_data.get("last_power", 0.0)
@@ -233,6 +235,22 @@ class HourlyAveragePowerSensor(GatedSensorEntity):
             hour_start_str = stored_data.get("hour_start")
             if hour_start_str:
                 self._hour_start = dt_util.parse_datetime(hour_start_str)
+            # Check if stored hour_start is in the current hour
+            if self._hour_start and (
+                self._hour_start.date() != current_hour_start.date()
+                or self._hour_start.hour != current_hour_start.hour
+            ):
+                # Different hour, reset accumulated energy
+                self._accumulated_energy = 0.0
+                self._last_power = 0.0
+                self._last_time = now
+                self._hour_start = current_hour_start
+        else:
+            # No stored data, initialize for current hour
+            self._accumulated_energy = 0.0
+            self._last_power = 0.0
+            self._last_time = now
+            self._hour_start = current_hour_start
 
         async def _async_hour_start(now):
             """Reset at the start of each hour."""
@@ -253,9 +271,6 @@ class HourlyAveragePowerSensor(GatedSensorEntity):
                 second=0,
             )
         )
-
-        # Initialize
-        await _async_hour_start(dt_util.utcnow())
 
         async def _async_state_changed(event):
             """Handle state changes of source or binary sensor."""
@@ -287,6 +302,7 @@ class HourlyAveragePowerSensor(GatedSensorEntity):
                     self._last_power = 0.0
             else:
                 self._last_power = 0.0
+            await self._save_state()
             self.async_write_ha_state()
 
         # Track state changes of source and binary sensors
